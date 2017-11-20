@@ -354,7 +354,6 @@ class PixivSpider(object):
         name = threading.current_thread().name
         while True:
             self.lock.acquire()
-            sleep(1)
             if self.q.empty():
                 self.lock.release()
                 if self.stop:
@@ -421,5 +420,5 @@ if __name__ == '__main__':
     spider = PixivSpider(username, password)
     spider.login()
     #spider.search('島風', hot=10000)
-    #spider.painter_search(212801, hot=10000)
+    #spider.painter_search(212801, hot=5000)
     spider.bookmark_search(hide=True, th_cnt=4)
