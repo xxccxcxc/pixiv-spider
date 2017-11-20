@@ -9,6 +9,7 @@ import threading
 from queue import Queue
 from PIL import Image
 from io import BytesIO
+from time import sleep
 import getpass
 
 # Pixiv爬虫
@@ -55,8 +56,9 @@ class PixivSpider(object):
         self.search_url = os.path.join(self.root_url, 'search.php')
         self.painter_info_url = os.path.join(self.root_url, 'member.php')
         self.painter_imgs_url = os.path.join(self.root_url, 'member_illust.php')
+        self.bookmark_url = os.path.join(self.root_url, 'bookmark.php')
 
-        self.root_path = r'F:\xxcc\program\python\projects\pixiv'
+        self.root_path = r'F:\xxcc\program\python\projects\pixiv-spider'
         self.save_path = os.path.join(self.root_path, 'data')
 
         self.q = Queue()
@@ -135,7 +137,7 @@ class PixivSpider(object):
                 if 'Refer' in headers.keys():
                     response = self.ses.get(url, headers=headers, params=params, timeout=60)
                 else:
-                    response = self.ses.get(url, headers=headers, params=params, timeout=10)
+                    response = self.ses.get(url, headers=headers, params=params, timeout=20)
                 return response
             except Exception as e:
                 print(e)
@@ -259,7 +261,38 @@ class PixivSpider(object):
             print('第{}页'.format(page))
             cur_url = url + '&p={}'.format(page)
             self.driver_get(cur_url)
-            if not self.parse_painter_search(self.driver.page_source):
+            if not self.parse_painter_or_bookmark_search(self.driver.page_source):
+                break
+            page = page + 1
+        self.driver.quit()
+        self.wait_threads()
+        print('搜索完成，成功保存{}张图片'.format(self.success_cnt))
+
+    # 功能：批量下载收藏的作品
+    # 参数：hide 是否下载私人收藏；tag 收藏的标签；th_cnt 线程数
+    # 返回值：无
+    def bookmark_search(self, hide=False, tag=None, th_cnt=8):
+        self.success_cnt = 0
+        self.hot = 0
+        self.th_cnt = th_cnt
+        self.init_threads()
+        url = self.bookmark_url + '?'
+        dirname = '收藏 ' + ('私人' if hide else '公开')
+        if hide:
+            url += 'rest=hide&'
+        if tag:
+            dirname += ' tag=' + self.clean_str(tag)
+            url += 'tag={}&'.format(tag)
+        self.dirname = dirname
+        dir_path = os.path.join(self.save_path, dirname)
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path)
+        page = 1
+        while True:
+            print('第{}页'.format(page))
+            cur_url = url + 'p={}'.format(page)
+            self.driver_get(cur_url)
+            if not self.parse_painter_or_bookmark_search(self.driver.page_source):
                 break
             page = page + 1
         self.driver.quit()
@@ -284,22 +317,22 @@ class PixivSpider(object):
             self.lock.release()
         return True
 
-    # 功能：解析画师作品页面
+    # 功能：解析画师作品页面或个人收藏页面
     # 参数：html 搜索页面源码
     # 返回值：bool类型，表示此页是否有图片
-    def parse_painter_search(self, html):
+    def parse_painter_or_bookmark_search(self, html):
         soup = BeautifulSoup(html, 'lxml')
         if soup.find('li', class_='_no-item'):
             return False
         for li in soup.find('ul', class_='_image-items').find_all('li', class_='image-item'):
-            if li.find('div', class_='page-count'):
-                # 图集
+            if li.find('div', class_='page-count') or li.find('a', class_='ugoku-illust'):
+                # 图集或GIF
                 continue
             if self.hot:
                 detail_url = os.path.join(self.root_url, li.a['href'][1:])
                 if not self.check_hot(detail_url):
                     continue
-            title = self.clean_str(li.find_all('a')[-1].h1['title'])
+            title = self.clean_str(li.find('h1', class_='title')['title'])
             url = os.path.splitext(li.a.div.img['data-src'].replace('c/150x150/img-master', 'img-original').replace('_master1200', ''))[0]
             print('发现 {} {}'.format(title, url))
             self.lock.acquire()
@@ -321,6 +354,7 @@ class PixivSpider(object):
         name = threading.current_thread().name
         while True:
             self.lock.acquire()
+            sleep(1)
             if self.q.empty():
                 self.lock.release()
                 if self.stop:
@@ -332,15 +366,26 @@ class PixivSpider(object):
                 types = ['.jpg', '.png']
                 img_type = None
                 size = 0
+                err = False
                 for cur_type in types:
                     cur_url = url + cur_type
-                    img = self.send_get(cur_url, headers={'Referer': self.root_url}).content
+                    try:
+                        img = self.send_get(cur_url, headers={'Referer': self.root_url}).content
+                    except:
+                        err = True
+                        break
                     try:
                         size = Image.open(BytesIO(img)).size
                         img_type = cur_type
                         break
                     except:
                         pass
+                if err:
+                    print(title, '获取失败')
+                    self.lock.acquire()
+                    self.q.put((title, url))
+                    self.lock.release()
+                    continue
                 if img_type is None:
                     print(title, '找不到正确类型')
                     continue
@@ -357,22 +402,24 @@ class PixivSpider(object):
     # 返回值：bool类型，若图片已存在返回False，否则返回True
     def save_img(self, img_bytes, title, img_type, size):
         filename = title + img_type
-        file_path = os.path.join(self.save_path, self.dirname, filename)
+        dir_path = os.path.join(self.save_path, self.dirname)
+        file_path = os.path.join(dir_path, filename)
         cnt = 0
         while os.path.exists(file_path):
             if Image.open(file_path).size == size:
                 return False
             cnt += 1
-            file_path = '{}({}){}'.format(filename, cnt, img_type)
+            file_path = os.path.join(dir_path, '{}({}){}'.format(filename, cnt, img_type))
         with open(file_path, 'wb') as fout:
             fout.write(img_bytes)
         return True
 
-
 if __name__ == '__main__':
     username = input('用户名：')
-    password = getpass.getpass(prompt='密码（不回显）：')
+    #password = getpass.getpass(prompt='密码（不回显）：')
+    password = input('密码：')
     spider = PixivSpider(username, password)
     spider.login()
     #spider.search('島風', hot=10000)
-    spider.painter_search(212801, hot=10000)
+    #spider.painter_search(212801, hot=10000)
+    spider.bookmark_search(hide=True, th_cnt=4)
